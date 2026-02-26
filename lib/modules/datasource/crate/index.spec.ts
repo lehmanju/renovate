@@ -35,10 +35,18 @@ function setupGitMocks(delayMs?: number): {
     .fn()
     .mockName('clone')
     .mockImplementation(
-      async (_registryUrl: string, clonePath: string, _opts) => {
+      async (registryUrl: string, clonePath: string, _opts) => {
         if (delayMs && delayMs > 0) {
           await setTimeout(delayMs);
         }
+
+        fs.writeFileSync(
+          `${clonePath}/config.json`,
+          JSON.stringify({
+            dl: `${registryUrl}/crates`,
+          }),
+          { encoding: 'utf8' },
+        );
 
         const path = `${clonePath}/my/pk/mypkg`;
         fs.mkdirSync(upath.dirname(path), { recursive: true });
@@ -119,6 +127,11 @@ describe('modules/datasource/crate/index', () => {
         cacheDir: upath.join(tmpDir.path, 'cache'),
       };
       GlobalConfig.set(adminConfig);
+
+      httpMock.scope(baseUrl).persist().get('/config.json').reply(200, {
+        dl: 'https://crates.io/crates',
+        api: 'https://crates.io',
+      });
 
       simpleGit.mockReset();
       memCache.init();
@@ -373,7 +386,14 @@ describe('modules/datasource/crate/index', () => {
 
       const url = 'https://github.com/mcorbin/othertestregistry';
       const sparseUrl = `sparse+${url}`;
-      httpMock.scope(url).get('/my/pk/mypkg').reply(200, {});
+      httpMock
+        .scope(url)
+        .get('/config.json')
+        .reply(200, {
+          dl: `${url}/crates`,
+        })
+        .get('/my/pk/mypkg')
+        .reply(200, {});
 
       const res = await getPkgReleases({
         datasource,
@@ -384,11 +404,69 @@ describe('modules/datasource/crate/index', () => {
       expect(res).toBeNull();
     });
 
+    it('sparse registry: uses dl field from config.json as dependency URL base', async () => {
+      GlobalConfig.set({ ...adminConfig, allowCustomCrateRegistries: true });
+
+      const url = 'https://nxrm.example.com/repository/crates.io';
+      const sparseUrl = `sparse+${url}`;
+      httpMock
+        .scope(url)
+        .get('/config.json')
+        .reply(200, {
+          dl: 'https://nxrm.example.com/repository/crates.io/crates',
+          api: 'https://nxrm.example.com/repository/crates.io',
+        })
+        .get('/my/pk/mypkg')
+        .reply(200, Fixtures.get('mypkg'));
+
+      const res = await getPkgReleases({
+        datasource,
+        packageName: 'mypkg',
+        registryUrls: [sparseUrl],
+      });
+      expect(res).not.toBeNull();
+      expect(res?.dependencyUrl).toBe(
+        'https://nxrm.example.com/repository/crates.io/crates/mypkg',
+      );
+    });
+
+    it('sparse registry: returns null when config.json has no dl field', async () => {
+      GlobalConfig.set({ ...adminConfig, allowCustomCrateRegistries: true });
+
+      const url = 'https://nxrm.example.com/repository/crates.io';
+      const sparseUrl = `sparse+${url}`;
+      httpMock.scope(url).get('/config.json').reply(200, {
+        api: 'https://nxrm.example.com/repository/crates.io',
+      });
+
+      const res = await getPkgReleases({
+        datasource,
+        packageName: 'mypkg',
+        registryUrls: [sparseUrl],
+      });
+      expect(res).toBeNull();
+    });
+
+    it('sparse registry: returns null when config.json fetch fails', async () => {
+      GlobalConfig.set({ ...adminConfig, allowCustomCrateRegistries: true });
+
+      const url = 'https://nxrm.example.com/repository/crates.io';
+      const sparseUrl = `sparse+${url}`;
+      httpMock.scope(url).get('/config.json').reply(500);
+
+      const res = await getPkgReleases({
+        datasource,
+        packageName: 'mypkg',
+        registryUrls: [sparseUrl],
+      });
+      expect(res).toBeNull();
+    });
+
     it('retries if shallow fails because of dumb http git repo', async () => {
       const mockClone = vi
         .fn()
         .mockName('clone')
-        .mockImplementation((_registryUrl: string, clonePath: string, opts) => {
+        .mockImplementation((registryUrl: string, clonePath: string, opts) => {
           if (typeof opts !== 'undefined' && Object.hasOwn(opts, '--depth')) {
             return Promise.reject(
               new Error(
@@ -396,6 +474,13 @@ describe('modules/datasource/crate/index', () => {
               ),
             );
           } else {
+            fs.writeFileSync(
+              `${clonePath}/config.json`,
+              JSON.stringify({
+                dl: `${registryUrl}/crates`,
+              }),
+              { encoding: 'utf8' },
+            );
             const path = `${clonePath}/my/pk/mypkg`;
             fs.mkdirSync(upath.dirname(path), { recursive: true });
             fs.writeFileSync(path, Fixtures.get('mypkg'), { encoding: 'utf8' });
@@ -418,7 +503,7 @@ describe('modules/datasource/crate/index', () => {
       expect(res).not.toBeNull();
       expect(res).toBeDefined();
       expect(res).toMatchObject({
-        dependencyUrl: 'https://github.com/mcorbin/testregistry/mypkg',
+        dependencyUrl: 'https://github.com/mcorbin/testregistry/crates/mypkg',
         registryUrl: 'https://github.com/mcorbin/testregistry',
         releases: [
           {
@@ -471,6 +556,7 @@ describe('modules/datasource/crate/index', () => {
         url: new URL('https://example.com'),
         flavor: 'cloudsmith',
         isSparse: false,
+        configDlUrl: 'https://example.com/crates',
       };
       const crateDatasource = new CrateDatasource();
       await expect(

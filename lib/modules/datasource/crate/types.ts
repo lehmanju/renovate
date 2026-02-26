@@ -2,9 +2,6 @@ export type RegistryFlavor =
   /** https://crates.io, supports rawgit access */
   | 'crates.io'
 
-  /** https://cloudsmith.io, needs git clone */
-  | 'cloudsmith'
-
   /** unknown, assuming private git repository */
   | 'other';
 
@@ -22,6 +19,18 @@ export interface RegistryInfo {
 
   /** path where the registry is cloned */
   clonePath?: string;
+
+  /**
+   * The `dl` field from the index config.json.
+   * See https://doc.rust-lang.org/cargo/reference/registry-index.html
+   */
+  configDlUrl: string;
+
+  /**
+   * The optional `api` field from the index config.json.
+   * See https://doc.rust-lang.org/cargo/reference/registry-index.html
+   */
+  configApiUrl?: string;
 }
 
 export interface CrateRecord {

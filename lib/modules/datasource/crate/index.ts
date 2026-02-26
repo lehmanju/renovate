@@ -47,14 +47,9 @@ export class CrateDatasource extends Datasource {
     super(CrateDatasource.id);
   }
 
-  override defaultRegistryUrls = ['https://crates.io'];
+  override defaultRegistryUrls = ['sparse+https://index.crates.io'];
 
   override defaultVersioning = cargoVersioning.id;
-
-  static readonly CRATES_IO_BASE_URL =
-    'https://raw.githubusercontent.com/rust-lang/crates.io-index/master/';
-
-  static readonly CRATES_IO_API_BASE_URL = 'https://crates.io/api/v1/';
 
   override readonly sourceUrlSupport = 'package';
   override readonly sourceUrlNote =
@@ -221,12 +216,8 @@ export class CrateDatasource extends Datasource {
       return readCacheFile(path, 'utf8');
     }
 
-    const baseUrl =
-      info.flavor === 'crates.io'
-        ? CrateDatasource.CRATES_IO_BASE_URL
-        : info.rawUrl;
-
     if (info.flavor === 'crates.io' || info.isSparse) {
+      const baseUrl = CrateDatasource.getRegistryIndexBaseUrl(info);
       const packageSuffix = CrateDatasource.getIndexSuffix(
         packageName.toLowerCase(),
       );
@@ -248,19 +239,9 @@ export class CrateDatasource extends Datasource {
     info: RegistryInfo,
     packageName: string,
   ): string {
-    switch (info.flavor) {
-      case 'crates.io':
-        return `https://crates.io/crates/${packageName}`;
-      case 'cloudsmith': {
-        // input: https://dl.cloudsmith.io/basic/$org/$repo/cargo/index.git
-        const tokens = info.url.pathname.split('/');
-        const org = tokens[2];
-        const repo = tokens[3];
-        return `https://cloudsmith.io/~${org}/repos/${repo}/packages/detail/cargo/${packageName}`;
-      }
-      default:
-        return `${info.rawUrl}/${packageName}`;
-    }
+    // Use the dl URL from index config.json as the dependency base URL.
+    // See https://doc.rust-lang.org/cargo/reference/registry-index.html
+    return joinUrlParts(info.configDlUrl, packageName);
   }
 
   /**
@@ -312,8 +293,6 @@ export class CrateDatasource extends Datasource {
     let flavor: RegistryFlavor;
     if (url.hostname === 'crates.io') {
       flavor = 'crates.io';
-    } else if (url.hostname === 'dl.cloudsmith.io') {
-      flavor = 'cloudsmith';
     } else {
       flavor = 'other';
     }
@@ -323,6 +302,8 @@ export class CrateDatasource extends Datasource {
       rawUrl: registryFetchUrl,
       url,
       isSparse: isSparseRegistry,
+      configDlUrl: '',
+      configApiUrl: undefined,
     };
 
     if (
@@ -334,7 +315,7 @@ export class CrateDatasource extends Datasource {
       );
       return null;
     }
-    if (registry.flavor !== 'crates.io' && !registry.isSparse) {
+    if (!registry.isSparse) {
       const cacheKey = `crate-datasource/registry-clone-path/${registryFetchUrl}`;
       const lockKey = registryFetchUrl;
 
@@ -387,6 +368,43 @@ export class CrateDatasource extends Datasource {
       } finally {
         releaseLock();
       }
+    }
+
+    const configUrl = registry.clonePath
+      ? upath.join(registry.clonePath, 'config.json')
+      : joinUrlParts(
+          CrateDatasource.getRegistryIndexBaseUrl(registry),
+          'config.json',
+        );
+
+    try {
+      const payload = await (registry.clonePath
+        ? readCacheFile(configUrl, 'utf8')
+        : this.http
+            .getJson<{ dl?: string; api?: string }>(configUrl)
+            .then((res) => res.body));
+
+      const config = registry.clonePath
+        ? CrateDatasource.parseRegistryConfig(payload)
+        : (payload as { dl?: string; api?: string });
+
+      if (!config.dl || typeof config.dl !== 'string') {
+        logger.warn(
+          { configUrl, registryUrl: registry.rawUrl },
+          'crate datasource: registry config.json does not contain a valid dl field',
+        );
+        return null;
+      }
+
+      registry.configDlUrl = config.dl;
+      registry.configApiUrl =
+        config.api && config.api.length > 0 ? config.api : undefined;
+    } catch (err) {
+      logger.warn(
+        { err, configUrl, registryUrl: registry.rawUrl },
+        'crate datasource: failed to read/fetch registry config.json',
+      );
+      return null;
     }
 
     return registry;
@@ -447,7 +465,7 @@ export class CrateDatasource extends Datasource {
   ): boolean {
     // We only cache public releases, we don't want to cache private
     // cloned data between runs.
-    return registryUrl === 'https://crates.io';
+    return registryUrl === 'https://index.crates.io';
   }
 
   public static getIndexSuffix(packageName: string): string[] {
@@ -470,7 +488,10 @@ export class CrateDatasource extends Datasource {
     { packageName, registryUrl }: PostprocessReleaseConfig,
     release: Release,
   ): Promise<PostprocessReleaseResult> {
-    if (release.releaseTimestamp || registryUrl !== 'https://crates.io') {
+    if (
+      release.releaseTimestamp ||
+      registryUrl !== 'sparse+https://index.crates.io'
+    ) {
       return release;
     }
 
@@ -495,7 +516,7 @@ export class CrateDatasource extends Datasource {
         namespace: `datasource-crate`,
         key: `postprocessRelease:${config.registryUrl}:${config.packageName}:${release.version}`,
         ttlMinutes: 7 * 24 * 60,
-        cacheable: config.registryUrl === 'https://crates.io',
+        cacheable: config.registryUrl === 'sparse+https://index.crates.io',
       },
       () => this._postprocessRelease(config, release),
     );
